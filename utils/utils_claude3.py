@@ -35,19 +35,19 @@ def _get_prompt_template(num_input_tokens, modelId):
     fillers=''
     i = num_input_tokens - 1
     i += 1 if _is_titan(modelId) else 0
-    for i in range(i):
+    for l in range(i):
         fillers += random.choice(['hello', 'world', 'foo', 'bar']) + ' '
         
     tokens = ''
     if _is_openai(modelId):
-        tokens += f'Ignore X ' + f'<X>{fillers}</X>\n'
+        pass
     elif _is_claude3(modelId):
-        tokens += f'Ignore X ' + f'<X>{fillers}</X>\n'
+        pass
     elif _is_titan(modelId):
         tokens += 'Human: '
-        tokens += f'Ignore the following words: {fillers}\n#\n'
     else:
         tokens += 'Human: '
+    tokens += f'Ignore X ' + f'<X>{fillers}</X>\n'
 
     if _is_titan(modelId):
         # This task prompt generates around 3K tokens out
@@ -156,11 +156,15 @@ anthropic_client = anthropic.Anthropic() # used to count tokens only
 def create_prompt(expected_num_tokens, modelId):
     logger.log(logging.DEBUG, f"create_prompt called with modelId: {modelId}")
     num_tokens_in_prompt_template = anthropic_client.count_tokens(_get_prompt_template(0, modelId))
+    #print(f"num_tokens_in_prompt_template:{num_tokens_in_prompt_template}")
     additional_tokens_needed = max(expected_num_tokens - num_tokens_in_prompt_template,0)
+    #print(f"additional_tokens_needed:{additional_tokens_needed}")
     logger.log(logging.DEBUG, f'expected_num_tokens={expected_num_tokens}, num_tokens_in_prompt_template={num_tokens_in_prompt_template}, additional_tokens_needed={additional_tokens_needed}')
     
     prompt_template = _get_prompt_template(additional_tokens_needed, modelId)
+    #print(f"prompt_template:{prompt_template}")
     actual_num_tokens = anthropic_client.count_tokens(prompt_template)
+    #print(f"actual_num_tokens:{actual_num_tokens}")
     logger.log(logging.DEBUG, f'expected_num_tokens={expected_num_tokens}, actual_tokens={actual_num_tokens}')
     assert expected_num_tokens==actual_num_tokens, f'Failed to generate prompt at required length: expected_num_tokens={expected_num_tokens} != actual_num_tokens={actual_num_tokens}'
     
@@ -177,8 +181,7 @@ def _send_request(client, modelId, req, stream):
         else:
             response = client.invoke_model(**req)
     return response
-   
-   
+ 
 def consume_openai_stream(response):
     first_byte = None
     stop_reason = None
@@ -221,9 +224,10 @@ def consume_bedrock_stream_new(response):
             chunk_json = json.loads(chunk.get('bytes').decode())
             if 'stop_reason' in chunk_json:
                 stop_reason = chunk_json['stop_reason']
-                if(stop_reason=='stop_sequence'):
-                    first_byte = int(float(chunk_json['amazon-bedrock-invocationMetrics']['firstByteLatency'])/1000)
-                    last_byte = int(float(chunk_json['amazon-bedrock-invocationMetrics']['invocationLatency'])/1000)
+                #print(f"stop_reason:{stop_reason}")
+                if(stop_reason=='max_tokens') or (stop_reason=='stop_sequence'):
+                    first_byte = float(chunk_json['amazon-bedrock-invocationMetrics']['firstByteLatency'])/1000
+                    last_byte = float(chunk_json['amazon-bedrock-invocationMetrics']['invocationLatency'])/1000
             if 'completionReason' in chunk_json:
                 stop_reason = chunk_json['completionReason']
     return first_byte, last_byte, stop_reason
@@ -244,8 +248,8 @@ def consume_bedrock_claude3_stream(response):
             # if 'completionReason' in chunk_json:
             #     stop_reason = chunk_json['completionReason']
     if(chunk_json['type']=='message_stop'):
-        first_byte = int(float(chunk_json['amazon-bedrock-invocationMetrics']['firstByteLatency'])/1000)
-        last_byte = int(float(chunk_json['amazon-bedrock-invocationMetrics']['invocationLatency'])/1000)
+        first_byte = float(chunk_json['amazon-bedrock-invocationMetrics']['firstByteLatency'])/1000
+        last_byte = float(chunk_json['amazon-bedrock-invocationMetrics']['invocationLatency'])/1000
     return first_byte,last_byte, stop_reason
 '''
 This method will invoke the model, possibly in streaming mode,
@@ -303,21 +307,20 @@ def benchmark(client, modelId, prompt, max_tokens_to_sample, stream=True, temper
             elif stream:
                 if _is_openai(modelId):
                     first_byte, stop_reason = consume_openai_stream(response)
+                    last_byte = time.time()
                 elif _is_claude3(modelId):
                     first_byte, last_byte, stop_reason = consume_bedrock_claude3_stream(response)
                 elif not _is_openai(modelId):
                     first_byte, last_byte, stop_reason = consume_bedrock_stream_new(response)
-                last_byte = time.time()
-            
             # verify we got all of the intended output tokens by verifying stop_reason
             valid_stop_reasons = ['max_tokens', 'length', 'LENGTH','stop_sequence','end_turn']
             assert stop_reason in valid_stop_reasons, f"stop_reason is {stop_reason} instead of 'max_tokens' or 'length', this means the model generated less tokens than required or stopped for a different reason."
             if _is_openai(modelId):
-                duration_to_first_byte = round(first_byte - start, 2)
-                duration_to_last_byte = round(last_byte - start, 2)
+                duration_to_first_byte = first_byte - start
+                duration_to_last_byte = last_byte - start
             else:
-                duration_to_first_byte = round(first_byte,2)
-                duration_to_last_byte = round(last_byte,2)
+                duration_to_first_byte = float(first_byte)
+                duration_to_last_byte = float(last_byte)
         except ClientError as err:
             if 'Thrott' in err.response['Error']['Code']:
                 logger.log(logging.INFO, f'Got ThrottlingException. Sleeping {SLEEP_ON_THROTTLING_SEC} sec and retrying.')
@@ -427,12 +430,11 @@ def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token', fi
         x_ticks_angle=0
 
     for scenario in scenarios:
-      invocations = [d[metric] for d in scenario['invocations']]
-      percentile_95 = round(np.percentile(invocations, 95),2)
-      percentile_99 = round(np.percentile(invocations, 99),2)
-      xlables.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np95={percentile_95}\np99={percentile_99}")
-
-      ax.boxplot(invocations, positions=[scenarios.index(scenario)])
+        invocations = [d[metric] for d in scenario['invocations']]
+        percentile_95 = round(np.percentile(invocations, 95),2)
+        percentile_99 = round(np.percentile(invocations, 99),2)
+        xlables.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np95={percentile_95}\np99={percentile_99}")
+        ax.boxplot(invocations, positions=[scenarios.index(scenario)])
 
     ax.set_title(title)
     #ax.set_xticks(range(1, len(scenarios) + 1))
@@ -441,3 +443,77 @@ def graph_scenarios_boxplot(scenarios, title, metric = 'time-to-first-token', fi
     ax.set_ylim(bottom=0) # Set y-axis to start at 0
     fig.tight_layout()
     plt.show()
+    
+def graph_scenarios_boxplot_save(scenarios, title, metric = 'time-to-first-token', figsize=(10, 6)):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    in_tokens = ''
+    out_tokens = ''
+
+    fig, ax = plt.subplots(figsize=figsize)
+    xlables = []
+    
+    # Angle labels if covering many scenarios, to avoid collisions
+    if len(scenarios) > 4:
+        x_ticks_angle=45
+    else:
+        x_ticks_angle=0
+
+    for scenario in scenarios:
+        invocations = [d[metric] for d in scenario['invocations']]
+        percentile_50 = round(np.percentile(invocations, 50),2)
+        percentile_95 = round(np.percentile(invocations, 95),2)
+        #percentile_99 = round(np.percentile(invocations, 99),2)
+        #xlables.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np95={percentile_95}\np99={percentile_99}")
+        xlables.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np50={percentile_50}\np95={percentile_95}")
+        in_tokens = scenario['in_tokens']
+        out_tokens = scenario['out_tokens']
+
+        ax.boxplot(invocations, positions=[scenarios.index(scenario)])
+
+    ax.set_title(title)
+    #ax.set_xticks(range(1, len(scenarios) + 1))
+    ax.set_xticklabels(xlables, rotation=x_ticks_angle, ha="right")
+    ax.set_ylabel(f'{metric} (sec)')
+    ax.set_ylim(bottom=0) # Set y-axis to start at 0
+    fig.tight_layout()
+    plt.savefig(f'title-{title},in-{in_tokens},out-{out_tokens},{metric}.png')
+    plt.show()
+    
+def save_to_csv(title,result):
+    import pandas as pd
+    import numpy as np
+    
+    in_tokens = ''
+    out_tokens = ''
+    for index,scenario in enumerate(result):
+        result[index]["label"] = scenario['model_id']+f"(in:{scenario['in_tokens']},out:{scenario['out_tokens']})"
+
+        metric = 'time-to-first-token'
+        invocations = [d[metric] for d in scenario['invocations']]
+        percentile_50 = round(np.percentile(invocations, 50),2)
+        percentile_95 = round(np.percentile(invocations, 95),2)
+        percentile_99 = round(np.percentile(invocations, 99),2)
+        #result1.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np95={percentile_95}\np99={percentile_99}")
+        result[index]["p50_first"] = percentile_50
+        result[index]["p95_first"] = percentile_95
+        result[index]["p99_first"] = percentile_95
+
+        metric = 'time-to-last-token'
+        invocations = [d[metric] for d in scenario['invocations']]
+        percentile_50 = round(np.percentile(invocations, 50),2)
+        percentile_95 = round(np.percentile(invocations, 95),2)
+        percentile_99 = round(np.percentile(invocations, 99),2)
+        #result1.append(f"{scenario['name']}\n(in={scenario['in_tokens']},out={scenario['out_tokens']}\np95={percentile_95}\np99={percentile_99}")
+        result[index]["p50_last"] = percentile_50
+        result[index]["p95_last"] = percentile_95
+        result[index]["p99_last"] = percentile_99
+        
+        in_tokens = scenario['in_tokens']
+        out_tokens = scenario['out_tokens']
+        
+    df = pd.DataFrame(result)
+    column_list=["label", "p50_first", "p95_first", "p99_first", "p50_last", "p95_last","p99_last"]
+
+    #filter the dataframe beforehand
+    df[column_list].to_csv(f'title-{title},in-{in_tokens},out-{out_tokens}.csv',index=False)
